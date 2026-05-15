@@ -1,13 +1,32 @@
+import os
 import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+LOCAL_VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"
+
+
+def relaunch_with_local_venv():
+    if os.environ.get("MASK2FORMER_SKIP_VENV_REEXEC"):
+        return
+    if not LOCAL_VENV_PYTHON.exists():
+        return
+    current_python = Path(sys.executable).resolve()
+    local_python = LOCAL_VENV_PYTHON.resolve()
+    if current_python == local_python:
+        return
+    os.environ["MASK2FORMER_SKIP_VENV_REEXEC"] = "1"
+    print(f"relaunching with local venv: {local_python}", flush=True)
+    os.execv(str(local_python), [str(local_python), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+relaunch_with_local_venv()
+
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from utils.training import TrainConfig, run_training
-
+import torch
 
 SCHOOL_ROOT = "school_notebooks_RU_lines"
 IAM_ROOT = "coco_lines_iam_test"
@@ -22,8 +41,8 @@ CONFIG = {
     "resume_from_checkpoint": None,
     "auto_resume": True,
     "output_dir": "mask2former_lines_school_iam_scratch",
-    "image_size": 1024,
-    "load_max_side": 1024,
+    "image_size": 960,
+    "load_max_side": 960,
     "epochs": 50,
     "batch_size": 1,
     "accumulation_steps": 8,
@@ -43,9 +62,20 @@ CONFIG = {
     "gradient_checkpointing": False,
     "augment": True,
     "augmentation_strength": "medium",
+    "require_cuda": True,
     "no_amp": False,
     "cpu": False,
 }
+
+
+def fail_if_cuda_required_but_unavailable():
+    if CONFIG["require_cuda"] and (CONFIG["cpu"] or not torch.cuda.is_available()):
+        raise RuntimeError(
+            "This launcher requires CUDA, but the active Python cannot use it. "
+            f"torch={torch.__version__}, torch.version.cuda={torch.version.cuda}, "
+            f"cuda_available={torch.cuda.is_available()}, cpu={CONFIG['cpu']}. "
+            "Install a CUDA-enabled PyTorch build or set CONFIG['require_cuda'] = False."
+        )
 
 
 def collect_split_dirs(root, splits):
@@ -69,6 +99,9 @@ def join_paths(paths):
 
 
 def build_config():
+    fail_if_cuda_required_but_unavailable()
+    from utils.training import TrainConfig
+
     train_img_dirs = []
     train_gt_dirs = []
     val_img_dirs = []
@@ -104,11 +137,18 @@ def build_config():
 
 
 def main():
+    fail_if_cuda_required_but_unavailable()
+    from utils.training import run_training
+
     config = build_config()
+    print("python:", sys.executable)
     print("train image dirs:", config.train_img_dir)
     print("train gt dirs:", config.train_gt_dir)
     print("val image dirs:", config.val_img_dir)
     print("val gt dirs:", config.val_gt_dir)
+    if os.environ.get("MASK2FORMER_DRY_RUN"):
+        print("dry run: training was not started")
+        return
     print(run_training(config))
 
 

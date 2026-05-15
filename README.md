@@ -56,6 +56,15 @@ By default this script trains on `school_notebooks_RU_lines/train_*` plus `coco_
 checkpoints in `CONFIG["output_dir"]` when they exist. Edit the constants at the top of the script to change paths,
 epochs, augmentation strength, or checkpoint settings.
 
+The school + IAM launcher has `CONFIG["require_cuda"] = True`, so it fails fast instead of silently training on CPU when
+the active Python has a CPU-only PyTorch build. Check the environment with:
+
+```powershell
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
+```
+
+This repository's `.venv` has a CUDA-enabled PyTorch build.
+
 Resume from the newest local checkpoint in `--output-dir`:
 
 ```powershell

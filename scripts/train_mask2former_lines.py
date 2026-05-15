@@ -61,6 +61,7 @@ def parse_args():
         choices=["light", "medium", "strong"],
         default=defaults.augmentation_strength,
     )
+    parser.add_argument("--require-cuda", action="store_true", default=defaults.require_cuda)
     parser.add_argument("--no-amp", action="store_true", default=defaults.no_amp)
     parser.add_argument("--cpu", action="store_true", default=defaults.cpu)
     return parser.parse_args()

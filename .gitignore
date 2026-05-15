@@ -82,6 +82,7 @@ target/
 handwritten_essay_v2_east_lines/
 school_notebooks_RU_east_lines/
 mask2former_lines_scratch/
+mask2former_lines_*/
 mask2former_lines_preview/
 coco_lines_prepared*/
 coco_lines_*/

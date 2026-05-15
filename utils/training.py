@@ -53,6 +53,7 @@ class TrainConfig:
     gradient_checkpointing: bool = False
     augment: bool = True
     augmentation_strength: str = "medium"
+    require_cuda: bool = False
     no_amp: bool = False
     cpu: bool = False
 
@@ -102,13 +103,46 @@ def restore_rng_state(state):
     if not state:
         return
     if state.get("python") is not None:
-        random.setstate(state["python"])
+        try:
+            random.setstate(state["python"])
+        except Exception as exc:
+            print(f"python RNG state restore skipped: {exc}")
     if state.get("numpy") is not None:
-        np.random.set_state(state["numpy"])
+        try:
+            np.random.set_state(state["numpy"])
+        except Exception as exc:
+            print(f"numpy RNG state restore skipped: {exc}")
     if state.get("torch") is not None:
-        torch.set_rng_state(state["torch"])
+        torch_state = rng_state_to_cpu_byte_tensor(state["torch"])
+        if torch_state is not None:
+            try:
+                torch.set_rng_state(torch_state)
+            except Exception as exc:
+                print(f"torch RNG state restore skipped: {exc}")
     if state.get("cuda") is not None and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        cuda_states = state["cuda"]
+        if torch.is_tensor(cuda_states):
+            cuda_states = [cuda_states]
+        restored = [rng_state_to_cpu_byte_tensor(item) for item in cuda_states]
+        restored = [item for item in restored if item is not None]
+        if restored:
+            try:
+                torch.cuda.set_rng_state_all(restored)
+            except Exception as exc:
+                print(f"cuda RNG state restore skipped: {exc}")
+
+
+def rng_state_to_cpu_byte_tensor(value):
+    try:
+        if torch.is_tensor(value):
+            return value.detach().cpu().to(torch.uint8)
+        if isinstance(value, (bytes, bytearray)):
+            return torch.tensor(list(value), dtype=torch.uint8)
+        if isinstance(value, (list, tuple)):
+            return torch.tensor(value, dtype=torch.uint8)
+    except Exception as exc:
+        print(f"RNG tensor conversion skipped: {exc}")
+    return None
 
 
 def torch_load(path, map_location):
@@ -364,7 +398,16 @@ def run_training(config=None):
     if resume_checkpoint is None and config.auto_resume:
         resume_checkpoint = find_resume_checkpoint(output_root)
 
-    device = torch.device("cuda" if torch.cuda.is_available() and not config.cpu else "cpu")
+    cuda_available = torch.cuda.is_available()
+    if config.require_cuda and (config.cpu or not cuda_available):
+        raise RuntimeError(
+            "CUDA is required by config.require_cuda=True, but this Python environment cannot use it. "
+            f"torch={torch.__version__}, torch.version.cuda={torch.version.cuda}, "
+            f"cuda_available={cuda_available}, cpu={config.cpu}. "
+            "Install a CUDA-enabled PyTorch build or set require_cuda=False."
+        )
+
+    device = torch.device("cuda" if cuda_available and not config.cpu else "cpu")
     use_amp = device.type == "cuda" and not config.no_amp
     print(f"device: {device}, amp: {use_amp}")
 
