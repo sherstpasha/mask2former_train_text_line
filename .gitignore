@@ -78,6 +78,16 @@ target/
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Local datasets, checkpoints, previews, and exports
+handwritten_essay_v2_east_lines/
+school_notebooks_RU_east_lines/
+mask2former_lines_scratch/
+mask2former_lines_preview/
+coco_lines_prepared*/
+coco_lines_*/
+school_notebooks_RU_lines*/
+*.onnx
+
 # IPython
 profile_default/
 ipython_config.py
