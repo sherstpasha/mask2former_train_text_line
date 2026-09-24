@@ -1,5 +1,6 @@
 import json
 import math
+import pickle
 import random
 import shutil
 import time
@@ -16,6 +17,7 @@ from .data import build_dataset, collate_fn, labels_to_device
 from .evaluation import evaluate_detection_metrics, evaluate_loss, write_epoch_previews
 from .modeling import (
     build_model_from_scratch,
+    build_model_from_pretrained,
     build_processor,
     load_model_and_processor_for_resume,
     resolve_checkpoint_model_dir,
@@ -25,12 +27,13 @@ from .modeling import (
 @dataclass
 class TrainConfig:
     model_config: str = "facebook/mask2former-swin-tiny-coco-instance"
+    pretrained: bool = False
     resume_from_checkpoint: Optional[str] = None
     auto_resume: bool = False
-    train_img_dir: str = "handwritten_essay_v2_east_lines/train_img"
-    train_gt_dir: str = "handwritten_essay_v2_east_lines/train_gt"
-    val_img_dir: str = "handwritten_essay_v2_east_lines/test_img"
-    val_gt_dir: str = "handwritten_essay_v2_east_lines/test_gt"
+    train_img_dir: str = ""
+    train_gt_dir: str = ""
+    val_img_dir: str = ""
+    val_gt_dir: str = ""
     output_dir: str = "mask2former_lines_scratch"
     image_size: int = 512
     load_max_side: int = 1024
@@ -38,12 +41,14 @@ class TrainConfig:
     batch_size: int = 1
     accumulation_steps: int = 8
     max_instances_per_image: int = 32
+    num_queries: int = 100
     lr: float = 1e-5
     weight_decay: float = 1e-4
     num_workers: int = 0
     seed: int = 42
     max_train_steps: Optional[int] = None
     max_val_steps: Optional[int] = None
+    evaluation_interval_epochs: int = 1
     checkpoint_interval_steps: int = 0
     preview_count: int = 3
     preview_threshold: float = 0.25
@@ -70,6 +75,9 @@ class TrainingResult:
 
 
 def validate_config(config):
+    for field_name in ("train_img_dir", "train_gt_dir", "val_img_dir", "val_gt_dir"):
+        if not getattr(config, field_name):
+            raise ValueError(f"{field_name} must be provided")
     if config.epochs < 1:
         raise ValueError("epochs must be >= 1")
     if config.batch_size < 1:
@@ -78,6 +86,8 @@ def validate_config(config):
         raise ValueError("accumulation_steps must be >= 1")
     if config.image_size < 1:
         raise ValueError("image_size must be >= 1")
+    if config.evaluation_interval_epochs < 1:
+        raise ValueError("evaluation_interval_epochs must be >= 1")
     if config.augmentation_strength not in {"light", "medium", "strong"}:
         raise ValueError("augmentation_strength must be one of: light, medium, strong")
 
@@ -166,10 +176,17 @@ def read_training_state_metadata(checkpoint_dir):
 
 def find_resume_checkpoint(output_dir):
     output_dir = Path(output_dir)
-    candidates = [output_dir / "latest", output_dir / "step_checkpoint", output_dir / "best"]
+    names = ("latest", "step_checkpoint", "best", "best_f1")
+    candidates = [output_dir / name for name in names]
     available = []
+    rejected = []
     for candidate in candidates:
-        metadata = read_training_state_metadata(candidate)
+        try:
+            metadata = read_training_state_metadata(candidate)
+        except (OSError, RuntimeError, EOFError, pickle.UnpicklingError, ValueError, TypeError, AttributeError) as exc:
+            print(f"skipping unreadable checkpoint {candidate}: {exc}", flush=True)
+            rejected.append(candidate)
+            continue
         if metadata is not None:
             try:
                 resolve_checkpoint_model_dir(candidate)
@@ -177,6 +194,12 @@ def find_resume_checkpoint(output_dir):
                 continue
             available.append((metadata["epoch"], metadata["step"], candidate))
     if not available:
+        if rejected:
+            raise RuntimeError(
+                "No readable training checkpoint found. Refusing to restart training "
+                "from scratch. Restore a checkpoint backup or explicitly choose model weights. "
+                f"Unreadable checkpoints: {', '.join(map(str, rejected))}"
+            )
         return None
     available.sort(key=lambda item: (item[0], item[1]), reverse=True)
     return available[0][2]
@@ -191,6 +214,24 @@ def load_best_val_loss(output_root):
         return float(metrics.get("val_loss", math.inf))
     except (OSError, ValueError, TypeError):
         return math.inf
+
+
+def load_best_detection_f1(output_root):
+    metrics_path = Path(output_root) / "best_f1" / "detection_metrics.json"
+    if not metrics_path.exists():
+        return -1.0
+    try:
+        return float(json.loads(metrics_path.read_text(encoding="utf-8")).get("f1", -1.0))
+    except (OSError, ValueError, TypeError):
+        return -1.0
+
+
+def append_training_history(output_root, record):
+    """Append one durable, machine-readable record per completed epoch."""
+    history_path = Path(output_root) / "training_history.jsonl"
+    with history_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        file.flush()
 
 
 def save_checkpoint(
@@ -415,15 +456,25 @@ def run_training(config=None):
         print(f"loading local checkpoint: {resume_checkpoint}")
         processor, model = load_model_and_processor_for_resume(resume_checkpoint)
     else:
-        print(f"initializing model from scratch from config: {config.model_config}")
-        print("pretrained model weights are not loaded")
         processor = build_processor(config.model_config)
-        model = build_model_from_scratch(
-            config.model_config,
-            num_labels=1,
-            id2label={0: "text_line"},
-            label2id={"text_line": 0},
-        )
+        if config.pretrained:
+            print(f"fine-tuning pretrained model: {config.model_config}")
+            model = build_model_from_pretrained(
+                config.model_config,
+                num_labels=1,
+                id2label={0: "text_line"},
+                label2id={"text_line": 0},
+                num_queries=config.num_queries,
+            )
+        else:
+            print(f"initializing model from scratch from config: {config.model_config}")
+            print("pretrained model weights are not loaded")
+            model = build_model_from_scratch(
+                config.model_config,
+                num_labels=1,
+                id2label={0: "text_line"},
+                label2id={"text_line": 0},
+            )
 
     if config.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         try:
@@ -434,13 +485,14 @@ def run_training(config=None):
 
     train_dataset = build_dataset(config.train_img_dir, config.train_gt_dir, config.load_max_side)
     val_dataset = build_dataset(config.val_img_dir, config.val_gt_dir, config.load_max_side)
-    preview_dataset = val_dataset.datasets[0] if isinstance(val_dataset, ConcatDataset) else val_dataset
+    preview_dataset = val_dataset
     val_loader = make_loader(val_dataset, processor, config, shuffle=False)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     best_val_loss = load_best_val_loss(output_root)
+    best_detection_f1 = load_best_detection_f1(output_root)
     start_epoch = 1
     resume_skip_steps = 0
     if resume_checkpoint:
@@ -478,13 +530,30 @@ def run_training(config=None):
             best_val_loss=best_val_loss,
         )
         resume_skip_steps = 0
-        val_loss = evaluate_loss(model, val_loader, device, use_amp, config.max_val_steps)
         completed_epoch = epoch
-        elapsed = time.time() - start_time
-        print(f"epoch {epoch}: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}, time={elapsed / 60:.1f} min")
-
         next_epoch = epoch + 1
-        if val_loss < best_val_loss:
+        should_evaluate = (
+            epoch % config.evaluation_interval_epochs == 0
+            or epoch == config.epochs
+        )
+        val_loss = None
+        metrics = None
+        if should_evaluate:
+            val_loss = evaluate_loss(model, val_loader, device, use_amp, config.max_val_steps)
+
+        elapsed = time.time() - start_time
+        if val_loss is None:
+            print(
+                f"epoch {epoch}: train_loss={train_loss:.6f}, "
+                f"evaluation skipped, time={elapsed / 60:.1f} min"
+            )
+        else:
+            print(
+                f"epoch {epoch}: train_loss={train_loss:.6f}, "
+                f"val_loss={val_loss:.6f}, time={elapsed / 60:.1f} min"
+            )
+
+        if val_loss is not None and val_loss < best_val_loss:
             best_val_loss = val_loss
             save_checkpoint(
                 model,
@@ -502,6 +571,7 @@ def run_training(config=None):
             )
             print(f"saved best checkpoint: {output_root / 'best'}")
 
+        checkpoint_loss = val_loss if val_loss is not None else train_loss
         save_checkpoint(
             model,
             processor,
@@ -510,45 +580,96 @@ def run_training(config=None):
             output_root / "latest",
             epoch=next_epoch,
             step=0,
-            loss=val_loss,
+            loss=checkpoint_loss,
             best_val_loss=best_val_loss,
             train_loss=train_loss,
             val_loss=val_loss,
             completed_epoch=epoch,
         )
 
-        metrics = evaluate_detection_metrics(
-            model,
-            processor,
-            preview_dataset,
-            device,
-            config.image_size,
-            config.preview_threshold,
-            config.preview_mask_threshold,
-            config.metric_iou_threshold,
-            config.metric_images,
-        )
-        if metrics.get("skipped"):
-            print("metrics skipped: metric_images=0")
-        else:
-            print(
-                f"metrics@IoU{config.metric_iou_threshold:.2f}: "
-                f"precision={metrics['precision']:.4f}, recall={metrics['recall']:.4f}, "
-                f"f1={metrics['f1']:.4f}, tp={metrics['tp']}, pred={metrics['pred']}, gt={metrics['gt']}"
+        if should_evaluate:
+            metrics = evaluate_detection_metrics(
+                model,
+                processor,
+                preview_dataset,
+                device,
+                config.image_size,
+                config.preview_threshold,
+                config.preview_mask_threshold,
+                config.metric_iou_threshold,
+                config.metric_images,
+            )
+            if metrics.get("skipped"):
+                print("metrics skipped: metric_images=0")
+            else:
+                print(
+                    f"metrics@IoU{config.metric_iou_threshold:.2f}: "
+                    f"precision={metrics['precision']:.4f}, recall={metrics['recall']:.4f}, "
+                    f"f1={metrics['f1']:.4f}, tp={metrics['tp']}, pred={metrics['pred']}, gt={metrics['gt']}"
+                )
+                if metrics["f1"] > best_detection_f1:
+                    best_detection_f1 = metrics["f1"]
+                    best_f1_dir = output_root / "best_f1"
+                    save_checkpoint(
+                        model,
+                        processor,
+                        optimizer,
+                        scaler,
+                        best_f1_dir,
+                        epoch=next_epoch,
+                        step=0,
+                        loss=val_loss,
+                        best_val_loss=best_val_loss,
+                        train_loss=train_loss,
+                        val_loss=val_loss,
+                        completed_epoch=epoch,
+                    )
+                    (best_f1_dir / "detection_metrics.json").write_text(
+                        json.dumps(metrics, indent=2), encoding="utf-8"
+                    )
+                    print(f"saved best detection checkpoint: {best_f1_dir}")
+
+            write_epoch_previews(
+                model,
+                processor,
+                preview_dataset,
+                output_root / "epoch_previews",
+                device,
+                epoch,
+                config.image_size,
+                config.preview_threshold,
+                config.preview_mask_threshold,
+                config.preview_count,
             )
 
-        write_epoch_previews(
-            model,
-            processor,
-            preview_dataset,
-            output_root / "epoch_previews",
-            device,
-            epoch,
-            config.image_size,
-            config.preview_threshold,
-            config.preview_mask_threshold,
-            config.preview_count,
-        )
+        history_record = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "best_val_loss": best_val_loss,
+            "evaluation_performed": should_evaluate,
+            "duration_seconds": elapsed,
+            "precision": None,
+            "recall": None,
+            "f1": None,
+            "tp": None,
+            "pred": None,
+            "gt": None,
+        }
+        if metrics is not None and not metrics.get("skipped"):
+            history_record.update(
+                {
+                    "precision": metrics["precision"],
+                    "recall": metrics["recall"],
+                    "f1": metrics["f1"],
+                    "tp": metrics["tp"],
+                    "pred": metrics["pred"],
+                    "gt": metrics["gt"],
+                }
+            )
+        append_training_history(output_root, history_record)
+        print(f"history appended: {output_root / 'training_history.jsonl'}")
 
     return TrainingResult(
         output_dir=str(output_root),

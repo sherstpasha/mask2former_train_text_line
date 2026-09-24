@@ -1,4 +1,5 @@
 from pathlib import Path
+import random
 
 import numpy as np
 import torch
@@ -95,7 +96,8 @@ def evaluate_detection_metrics(
             "skipped": True,
         }
     images = min(max_images, len(dataset))
-    progress = tqdm(range(images), desc="metrics", leave=True, dynamic_ncols=True)
+    indices = random.Random(1701).sample(range(len(dataset)), images)
+    progress = tqdm(indices, desc="metrics", leave=True, dynamic_ncols=True)
     for index in progress:
         item = dataset[index]
         image = item["image"]
@@ -129,22 +131,22 @@ def evaluate_detection_metrics(
     }
 
 
-def draw_preview(image, gt_polygons, pred_masks, pred_scores, output_path):
+def draw_preview(image, gt_polygons, pred_masks, pred_scores, output_path, min_score=0.25):
     overlay = image.copy()
     draw = ImageDraw.Draw(overlay, "RGBA")
     for polygon in gt_polygons:
-        draw.line(polygon + [polygon[0]], fill=(255, 80, 80, 230), width=2)
+        draw.line(polygon + [polygon[0]], fill=(40, 220, 80, 230), width=2)
 
-    for mask, score in postprocess_line_masks(pred_masks, pred_scores):
+    for mask, score in postprocess_line_masks(pred_masks, pred_scores, min_score=min_score):
         contour = mask_to_contour(mask)
         if contour is None:
             continue
         points = [(float(x), float(y)) for x, y in contour]
-        draw.polygon(points, fill=(40, 220, 80, 55))
-        draw.line(points + [points[0]], fill=(40, 220, 80, 230), width=2)
+        draw.polygon(points, fill=(255, 80, 80, 45))
+        draw.line(points + [points[0]], fill=(255, 80, 80, 230), width=2)
         x_min = min(x for x, _ in points)
         y_min = min(y for _, y in points)
-        draw.rectangle([x_min, y_min, x_min + 60, y_min + 18], fill=(40, 220, 80, 190))
+        draw.rectangle([x_min, y_min, x_min + 60, y_min + 18], fill=(255, 80, 80, 190))
         draw.text((x_min + 4, y_min + 1), f"{float(score):.2f}", fill=(0, 0, 0, 255))
 
     output_path = Path(output_path)
@@ -166,13 +168,21 @@ def write_epoch_previews(
 ):
     if count <= 0:
         return
-    for index in range(min(count, len(dataset))):
+    indices = random.Random(1009 + epoch).sample(range(len(dataset)), min(count, len(dataset)))
+    for index in indices:
         item = dataset[index]
         image = item["image"]
         try:
             pred_masks, pred_scores = predict_masks(model, processor, image, device, image_size, threshold, mask_threshold)
             output_path = Path(output_dir) / f"epoch_{epoch:03d}_{Path(item['path']).stem}.png"
-            draw_preview(image, item["polygons"], pred_masks, pred_scores, output_path)
+            draw_preview(
+                image,
+                item["polygons"],
+                pred_masks,
+                pred_scores,
+                output_path,
+                min_score=threshold,
+            )
             print(f"preview: {output_path} gt={len(item['polygons'])} pred={len(pred_scores)}")
         except Exception as exc:
             if torch.cuda.is_available():

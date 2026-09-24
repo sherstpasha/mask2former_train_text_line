@@ -6,7 +6,4 @@ tqdm
 opencv-python
 gradio
 onnx
-onnxruntime
-shapely
-concave-hull
-alphashape
+onnxscript

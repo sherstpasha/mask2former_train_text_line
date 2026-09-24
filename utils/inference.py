@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
+from .data import letterbox_image
 from .postprocess import mask_bbox, mask_to_contour, postprocess_line_masks
 
 
@@ -21,20 +22,36 @@ def resize_for_inference(image, max_side):
 @torch.no_grad()
 def predict_masks(model, processor, image, device, image_size, threshold, mask_threshold):
     model.eval()
-    inputs = processor(images=image, size={"height": image_size, "width": image_size}, return_tensors="pt")
+    original_size = image.size
+    model_image, _, left, top, resized_size = letterbox_image(image, image_size)
+    inputs = processor(images=model_image, do_resize=False, return_tensors="pt")
     inputs = {key: value.to(device) for key, value in inputs.items()}
     outputs = model(**inputs)
     results = processor.post_process_instance_segmentation(
         outputs,
         threshold=threshold,
         mask_threshold=mask_threshold,
-        target_sizes=[image.size[::-1]],
+        target_sizes=[(image_size, image_size)],
         return_binary_maps=True,
     )[0]
     if results["segmentation"] is None:
         return [], []
-    scores = [item["score"] for item in results["segments_info"]]
-    return results["segmentation"], scores
+    scores = [
+        float(item["score"].detach().cpu()) if torch.is_tensor(item["score"]) else float(item["score"])
+        for item in results["segments_info"]
+    ]
+    restored_masks = []
+    for mask in results["segmentation"]:
+        if torch.is_tensor(mask):
+            mask = mask.detach().cpu().numpy()
+        mask = np.asarray(mask, dtype=np.uint8)
+        cropped = mask[top : top + resized_size[1], left : left + resized_size[0]]
+        restored = Image.fromarray(cropped * 255, mode="L").resize(
+            original_size,
+            getattr(Image, "Resampling", Image).NEAREST,
+        )
+        restored_masks.append(np.asarray(restored, dtype=np.uint8) > 0)
+    return restored_masks, scores
 
 
 def detect_image(model, processor, image, device, image_size, threshold, mask_threshold):

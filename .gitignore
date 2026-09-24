@@ -84,6 +84,9 @@ school_notebooks_RU_east_lines/
 mask2former_lines_scratch/
 mask2former_lines_*/
 mask2former_lines_preview/
+page_lines_prepared/
+mask2former_lines_swin_small_page/
+pretrained/
 coco_lines_prepared*/
 coco_lines_*/
 school_notebooks_RU_lines*/

@@ -29,6 +29,12 @@ AUGMENTATION_PROFILES = {
         "translate_fraction": 0.02,
         "scale_delta": 0.04,
         "shear_degrees": 1.0,
+        "brightness_range": (0.85, 1.15),
+        "contrast_range": (0.85, 1.18),
+        "color_range": (0.85, 1.12),
+        "noise_sigma_range": (3.0, 8.0),
+        "blur_radius_range": (0.2, 0.7),
+        "jpeg_quality_range": (65, 90),
     },
     "medium": {
         "probability": 0.85,
@@ -38,10 +44,16 @@ AUGMENTATION_PROFILES = {
         "blur_probability": 0.16,
         "jpeg_probability": 0.14,
         "grayscale_probability": 0.08,
-        "rotate_degrees": 4.0,
-        "translate_fraction": 0.04,
-        "scale_delta": 0.07,
-        "shear_degrees": 2.0,
+        "rotate_degrees": 7.0,
+        "translate_fraction": 0.07,
+        "scale_delta": 0.12,
+        "shear_degrees": 4.0,
+        "brightness_range": (0.70, 1.30),
+        "contrast_range": (0.70, 1.40),
+        "color_range": (0.65, 1.30),
+        "noise_sigma_range": (4.0, 16.0),
+        "blur_radius_range": (0.4, 1.5),
+        "jpeg_quality_range": (35, 80),
     },
     "strong": {
         "probability": 0.95,
@@ -51,10 +63,16 @@ AUGMENTATION_PROFILES = {
         "blur_probability": 0.22,
         "jpeg_probability": 0.20,
         "grayscale_probability": 0.12,
-        "rotate_degrees": 6.0,
-        "translate_fraction": 0.06,
-        "scale_delta": 0.10,
-        "shear_degrees": 3.0,
+        "rotate_degrees": 12.0,
+        "translate_fraction": 0.12,
+        "scale_delta": 0.20,
+        "shear_degrees": 7.0,
+        "brightness_range": (0.50, 1.50),
+        "contrast_range": (0.50, 1.70),
+        "color_range": (0.40, 1.60),
+        "noise_sigma_range": (8.0, 28.0),
+        "blur_radius_range": (0.8, 2.5),
+        "jpeg_quality_range": (18, 65),
     },
 }
 
@@ -121,13 +139,46 @@ def resize_polygons(polygons, from_size, to_size):
     return [[(x * scale_x, y * scale_y) for x, y in polygon] for polygon in polygons]
 
 
+def letterbox_image(image, image_size, fill=(255, 255, 255)):
+    """Resize without changing aspect ratio and center on a square canvas."""
+    width, height = image.size
+    scale = min(image_size / width, image_size / height)
+    resized_size = (
+        max(1, int(round(width * scale))),
+        max(1, int(round(height * scale))),
+    )
+    resized = image.resize(resized_size, BILINEAR)
+    left = (image_size - resized_size[0]) // 2
+    top = (image_size - resized_size[1]) // 2
+    canvas = Image.new("RGB", (image_size, image_size), fill)
+    canvas.paste(resized, (left, top))
+    return canvas, scale, left, top, resized_size
+
+
+def polygons_to_binary_masks(polygons, image_size):
+    """Keep instances independent so overlapping line polygons are not overwritten."""
+    width, height = image_size
+    masks = []
+    for polygon in polygons:
+        if len(polygon) < 3:
+            continue
+        mask_image = Image.new("L", (width, height), 0)
+        ImageDraw.Draw(mask_image).polygon(polygon, fill=1)
+        mask = np.asarray(mask_image, dtype=np.uint8)
+        if mask.any():
+            masks.append(mask)
+    if not masks:
+        return np.zeros((0, height, width), dtype=np.uint8)
+    return np.stack(masks, axis=0)
+
+
 def resize_sample_to_model_size(image, polygons, image_size):
-    old_size = image.size
-    if image.size != (image_size, image_size):
-        image = image.resize((image_size, image_size), BILINEAR)
-        polygons = resize_polygons(polygons, old_size, image.size)
-    segmentation_map, _ = polygons_to_instance_map(polygons, image.size)
-    return image, segmentation_map
+    image, scale, left, top, _ = letterbox_image(image, image_size)
+    polygons = [
+        [(x * scale + left, y * scale + top) for x, y in polygon]
+        for polygon in polygons
+    ]
+    return image, polygons_to_binary_masks(polygons, image.size)
 
 
 def affine_augmentation_matrix(width, height, profile):
@@ -155,7 +206,7 @@ def affine_augmentation_matrix(width, height, profile):
     return (back @ shear_matrix @ rotation @ to_origin)[:2]
 
 
-def apply_geometric_augmentation(image, segmentation_map, profile):
+def apply_geometric_augmentation(image, instance_masks, profile):
     if cv2 is None:
         raise ImportError("opencv-python is required for geometric training augmentations")
 
@@ -170,34 +221,42 @@ def apply_geometric_augmentation(image, segmentation_map, profile):
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(255, 255, 255),
     )
-    augmented_segmentation = cv2.warpAffine(
-        segmentation_map.astype(np.float32, copy=False),
-        matrix,
-        (width, height),
-        flags=cv2.INTER_NEAREST,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0,
-    ).astype(np.int32, copy=False)
-    return Image.fromarray(augmented_image, mode="RGB"), augmented_segmentation
+    augmented_masks = []
+    for mask in instance_masks:
+        augmented_masks.append(
+            cv2.warpAffine(
+                mask,
+                matrix,
+                (width, height),
+                flags=cv2.INTER_NEAREST,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            ).astype(np.uint8, copy=False)
+        )
+    if augmented_masks:
+        augmented_masks = np.stack(augmented_masks, axis=0)
+    else:
+        augmented_masks = np.zeros((0, height, width), dtype=np.uint8)
+    return Image.fromarray(augmented_image, mode="RGB"), augmented_masks
 
 
 def apply_color_augmentation(image, profile):
     if random.random() < profile["color_probability"]:
-        image = ImageEnhance.Brightness(image).enhance(random.uniform(0.75, 1.25))
-        image = ImageEnhance.Contrast(image).enhance(random.uniform(0.75, 1.30))
-        image = ImageEnhance.Color(image).enhance(random.uniform(0.75, 1.20))
+        image = ImageEnhance.Brightness(image).enhance(random.uniform(*profile["brightness_range"]))
+        image = ImageEnhance.Contrast(image).enhance(random.uniform(*profile["contrast_range"]))
+        image = ImageEnhance.Color(image).enhance(random.uniform(*profile["color_range"]))
     if random.random() < profile["grayscale_probability"]:
         image = ImageOps.grayscale(image).convert("RGB")
     if random.random() < profile["blur_probability"]:
-        image = image.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.2, 1.0)))
+        image = image.filter(ImageFilter.GaussianBlur(radius=random.uniform(*profile["blur_radius_range"])))
     if random.random() < profile["noise_probability"]:
         array = np.asarray(image).astype(np.float32)
-        sigma = random.uniform(3.0, 12.0)
+        sigma = random.uniform(*profile["noise_sigma_range"])
         noise = np.random.normal(0.0, sigma, array.shape).astype(np.float32)
         image = Image.fromarray(np.clip(array + noise, 0, 255).astype(np.uint8), mode="RGB")
     if random.random() < profile["jpeg_probability"]:
         buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=random.randint(45, 90))
+        image.save(buffer, format="JPEG", quality=random.randint(*profile["jpeg_quality_range"]))
         buffer.seek(0)
         image = Image.open(buffer).convert("RGB")
     return image
@@ -245,20 +304,13 @@ class LineInstanceDataset(Dataset):
 def encode_instance_targets(segmentation_maps, max_instances_per_image):
     mask_labels = []
     class_labels = []
-    for segmentation_map in segmentation_maps:
-        segmentation = torch.from_numpy(segmentation_map.astype(np.int64, copy=False))
-        instance_ids = torch.unique(segmentation)
-        instance_ids = instance_ids[instance_ids != 0]
-        if max_instances_per_image and len(instance_ids) > max_instances_per_image:
-            areas = torch.stack([(segmentation == instance_id).sum() for instance_id in instance_ids])
+    for instance_masks in segmentation_maps:
+        masks = torch.from_numpy(instance_masks.astype(np.float32, copy=False))
+        if max_instances_per_image and len(masks) > max_instances_per_image:
+            areas = masks.sum(dim=(1, 2))
             keep = torch.argsort(areas, descending=True)[:max_instances_per_image]
-            instance_ids = instance_ids[keep]
-        if len(instance_ids) == 0:
-            masks = torch.zeros((0, *segmentation.shape), dtype=torch.float32)
-            classes = torch.zeros((0,), dtype=torch.int64)
-        else:
-            masks = torch.stack([(segmentation == instance_id) for instance_id in instance_ids]).float()
-            classes = torch.zeros((len(instance_ids),), dtype=torch.int64)
+            masks = masks[keep]
+        classes = torch.zeros((len(masks),), dtype=torch.int64)
         mask_labels.append(masks)
         class_labels.append(classes)
     return mask_labels, class_labels
